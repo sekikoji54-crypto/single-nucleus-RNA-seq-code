@@ -1,0 +1,171 @@
+################################################################################
+# Volcano plot (PUBLIC-SAFE, anonymized)
+#
+# - No hard-coded absolute/local paths
+# - Input/output provided via command-line arguments
+# - Highlights user-specified genes with custom colors
+# - Labels: top N significant genes + highlighted genes
+#
+# Usage:
+#   Rscript volcano_highlight_public_safe.R \
+#     --in  path/to/features.csv \
+#     --out results/volcano_highlight.tiff
+#
+# CSV requirements (default column names):
+#   - FeatureName
+#   - <comparison> Log2 Fold Change
+#   - <comparison> P-Value
+#
+# You can override column names via:
+#   --fc_col "KO-axo_ChAT Log2 Fold Change" --p_col "KO-axo_ChAT P-Value"
+################################################################################
+
+suppressPackageStartupMessages({
+  pkgs <- c("ggplot2", "ggrepel", "dplyr", "readr", "stringr")
+  to_install <- pkgs[!vapply(pkgs, requireNamespace, logical(1), quietly = TRUE)]
+  if (length(to_install) > 0) install.packages(to_install, dependencies = TRUE)
+
+  lapply(pkgs, library, character.only = TRUE)
+})
+
+set.seed(1)
+
+#-----------------------------#
+# 0) Argument parsing         #
+#-----------------------------#
+args <- commandArgs(trailingOnly = TRUE)
+
+get_arg <- function(flag, default = NULL) {
+  hit <- which(args == flag)
+  if (length(hit) == 1 && length(args) >= hit + 1) return(args[hit + 1])
+  default
+}
+
+infile  <- get_arg("--in")
+outfile <- get_arg("--out", default = file.path("results", "volcano_highlight.tiff"))
+
+# Optional overrides for column names
+fc_col  <- get_arg("--fc_col", default = "KO-axo_ChAT Log2 Fold Change")
+p_col   <- get_arg("--p_col",  default = "KO-axo_ChAT P-Value")
+
+# Optional plot parameters
+p_cut   <- as.numeric(get_arg("--p_cut", default = "0.05"))
+top_n   <- as.integer(get_arg("--top_n", default = "20"))
+
+if (is.null(infile)) stop("Missing required argument: --in <path_to_csv>")
+if (!file.exists(infile)) stop("Input CSV not found (path not printed).")
+
+out_dir <- dirname(outfile)
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+message("Generating volcano plot (paths are not printed).")
+message("Output will be written under the specified output directory.")
+
+#-----------------------------#
+# 1) Read data (robust)       #
+#-----------------------------#
+# Use read.csv for maximum compatibility with user exports (non-standard colnames)
+df <- read.csv(infile, check.names = FALSE)
+
+req <- c("FeatureName", fc_col, p_col)
+if (!all(req %in% names(df))) {
+  stop(
+    paste0(
+      "Required columns are missing.\n",
+      "Expected: FeatureName, '", fc_col, "', '", p_col, "'.\n",
+      "Found columns include: ",
+      paste(head(names(df), 20), collapse = ", "),
+      ifelse(ncol(df) > 20, ", ...", "")
+    )
+  )
+}
+
+#-----------------------------#
+# 2) Prepare volcano data     #
+#-----------------------------#
+df <- df %>%
+  mutate(
+    log2fc     = .data[[fc_col]],
+    pval       = .data[[p_col]],
+    neglog10P  = -log10(pval),
+    Status = case_when(
+      is.na(pval)           ~ "NS",
+      pval > p_cut          ~ "NS",
+      log2fc > 0            ~ "Up",
+      log2fc < 0            ~ "Down",
+      TRUE                  ~ "NS"
+    )
+  )
+
+#-----------------------------#
+# 3) Colors & highlighted genes
+#-----------------------------#
+base_colors <- c(
+  Up   = "#E41A1C",   # red
+  Down = "#00AFC6",   # cyan
+  NS   = "#BFBFBF"    # grey
+)
+)
+
+df$ColorMapped <- base_colors[df$Status]
+ix_special <- df$FeatureName %in% names(special_colors)
+df$ColorMapped[ix_special] <- special_colors[df$FeatureName[ix_special]]
+
+#-----------------------------#
+# 4) Label selection          #
+#-----------------------------#
+top_sig <- df %>%
+  filter(!is.na(pval), pval <= p_cut) %>%
+  arrange(pval) %>%
+  slice_head(n = top_n)
+
+label_df <- bind_rows(
+  top_sig,
+  df %>% filter(FeatureName %in% names(special_colors))
+) %>%
+  distinct(FeatureName, .keep_all = TRUE)
+
+#-----------------------------#
+# 5) Plot                     #
+#-----------------------------#
+p <- ggplot(df, aes(x = log2fc, y = neglog10P)) +
+  geom_point(aes(color = ColorMapped), size = 1.8, alpha = 0.9) +
+  geom_hline(yintercept = -log10(p_cut), linetype = "dashed", linewidth = 0.5) +
+  geom_vline(xintercept = 0, linetype = "solid", linewidth = 0.4) +
+  ggrepel::geom_text_repel(
+    data = label_df,
+    aes(label = FeatureName, color = ColorMapped),
+    size = 3.5, box.padding = 0.35, point.padding = 0.25,
+    max.overlaps = Inf, min.segment.length = 0
+  ) +
+  scale_color_identity() +
+  labs(
+    title = "Volcano plot: KO-axotomy vs WT-axotomy (ChAT)",
+    x = "Log2 fold change (KO-axotomy vs WT-axotomy)",
+    y = expression(-log[10](p))
+  ) +
+  theme_minimal(base_family = "Arial") +
+  theme(
+    plot.title       = element_text(size = 13, face = "bold"),
+    axis.title       = element_text(size = 12),
+    panel.grid.major = element_line(color = "grey80", linewidth = 0.5),
+    panel.grid.minor = element_line(color = "grey90", linewidth = 0.3),
+    legend.position  = "none"
+  )
+
+print(p)
+
+#-----------------------------#
+# 6) Save                     #
+#-----------------------------#
+ggsave(
+  filename = outfile,
+  plot = p,
+  width = 7.2, height = 5.8,
+  dpi = 300,
+  device = "tiff",
+  compression = "lzw"
+)
+
+writeLines(capture.output(sessionInfo()), file.path(out_dir, "sessionInfo.txt"))
+message("Done.")
